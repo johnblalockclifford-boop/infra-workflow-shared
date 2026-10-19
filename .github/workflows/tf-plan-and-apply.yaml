@@ -57,12 +57,12 @@ jobs:
         id: init
         run: terraform init -backend-config="key=$TF_ENV.tfstate"
 
-      - name: Terraform validate
+      - name: Terraform shared validate
         id: validate
         run: terraform validate -no-color
 
         # An exit code of 0 indicated no changes, 1 a terraform failure, 2 there are pending changes.
-      - name: Terraform plan
+      - name: Terraform shared plan
         id: tf-plan
         run: |
           export exitcode=0
@@ -83,7 +83,7 @@ jobs:
           fi
           exit 0 # Ensure the script exits successfully
 
-      - name: Publish Plan
+      - name: Publish shared Plan
         uses: actions/upload-artifact@v5
         with:
           name: tfplan-${{ inputs.environment }}
