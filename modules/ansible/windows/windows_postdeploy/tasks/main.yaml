@@ -1,0 +1,92 @@
+# windows_postdeploy/tasks/main.yml
+
+---
+# Note: gather_facts is generally done at the play level instead of role, 
+# but I believe we need to refresh hardware info for uninitialized disks.
+
+- name: Gather updated hardware facts
+  setup:
+    gather_subset:
+      - hardware
+
+###################################################################
+# 1. Set Time Zone
+###################################################################
+- name: Set Time Zone
+  win_timezone:
+    timezone: "{{ time_zone }}"
+
+###################################################################
+# 2. Identify & Format Uninitialized Disks
+###################################################################
+- name: Find uninitialized disks
+  set_fact:
+    uninitialized_disks: >-
+      {{ ansible_facts.disks | json_query('[?partitions == `0`].number') }}
+
+- name: Get existing drive letters
+  win_shell: "Get-Volume | Select-Object -ExpandProperty DriveLetter"
+  register: existing_drive_letters
+
+- name: Initialize drive letters list
+  set_fact:
+    available_drive_letters: >-
+      {{
+        (['D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'Q', 'R', 'V', 'W', 'X', 'Y', 'Z'])
+        | difference(existing_drive_letters.stdout_lines | map('upper'))
+      }}
+
+- name: Partition & format each uninitialized disk
+  block:
+    - name: "Determine next available drive letter"
+      set_fact:
+        next_drive_letter: "{{ available_drive_letters | first }}"
+      with_items: "{{ uninitialized_disks }}"
+      loop_control:
+        loop_var: item
+
+    - name: "Partition disk {{ item }}"
+      win_partition:
+        disk_number: "{{ item }}"
+        drive_letter: "{{ next_drive_letter }}"
+        partition_size: 100%
+      register: partition_result
+      with_items: "{{ uninitialized_disks }}"
+      loop_control:
+        loop_var: item
+
+    - name: "Format the new partition to NTFS"
+      win_format:
+        drive_letter: "{{ next_drive_letter }}"
+        file_system: "NTFS"
+      when: partition_result.changed
+      with_items: "{{ uninitialized_disks }}"
+      loop_control:
+        loop_var: item
+
+    - name: "Remove used drive letter from available list"
+      set_fact:
+        available_drive_letters: "{{ available_drive_letters[1:] }}"
+      with_items: "{{ uninitialized_disks }}"
+      loop_control:
+        loop_var: item
+  when: uninitialized_disks | length > 0
+
+###################################################################
+# 3. Set Power Plan to High Performance
+###################################################################
+- name: Set Power Plan
+  win_shell: "powercfg.exe /setactive SCHEME_MIN"
+
+###################################################################
+# 4. Join Domain
+###################################################################
+- name: Join domain {{ domain_name }}
+  microsoft.ad.membership:
+    dns_domain_name: "{{ domain_name }}"
+    domain_admin_user: "{{ lookup('env', 'DOMAIN_JOIN_USERNAME') }}" 
+    domain_admin_password: "{{ lookup('env', 'DOMAIN_JOIN_PASSWORD') }}"
+    domain_ou_path: "OU=Faith Servers,DC=faith1,DC=net"
+    state: domain
+  register: join_result
+  notify: "Reboot Windows"

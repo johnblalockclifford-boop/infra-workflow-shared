@@ -1,0 +1,19 @@
+{
+  "changed_modules": [
+    {
+      "name": "t-servicebus",
+      "path": "terraform/servicebus",
+      "type": "terraform",
+      "description": "Private-only Azure Service Bus (Premium) with UAMI RBAC, on-prem SAS auth, and a private Key Vault",
+      "readme_path": "modules/terraform/servicebus/README.md"
+    }
+  ],
+  "module_versions": {
+    "t-servicebus": {
+      "current_version": "0.0.1",
+      "suggested_version": "0.0.2",
+      "source": "git_tag"
+    }
+  },
+  "analysis_summary": "Found 1 modules with changes."
+}

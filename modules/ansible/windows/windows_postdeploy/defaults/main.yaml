@@ -1,0 +1,8 @@
+# windows_postdeploy/defaults/main.yml
+
+domain_name: "faith1.net"
+organizational_unit: "OU=Faith Servers,DC=faith1,DC=net"
+time_zone: "Central Standard Time"
+
+# Default list of drive letters to assign
+disk_letters_list: ["E","F","G","H","I","J","K","L"]

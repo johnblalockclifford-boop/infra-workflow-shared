@@ -1,0 +1,57 @@
+[project]
+name = "module-automation"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1.8",
+    "gitpython>=3.1.45",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.5",
+    "semver>=3.0.4",
+]
+
+
+[tool.ruff]
+line-length = 100
+indent-width = 2
+# Assume Python 3.9
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]
+extend-select = ["E501"]
+ignore = ["B008"]
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "app.core.auth.require_role", "app.core.auth.require_any_role"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# Enable auto-formatting of code examples in docstrings. Markdown,
+# reStructuredText code/literal blocks and doctests are all supported.
+#
+# This is currently disabled by default, but it is planned for this
+# to be opt-out in the future.
+docstring-code-format = false
+
+# Set the line length limit used when formatting code snippets in
+# docstrings.
+#
+# This only has an effect when the `docstring-code-format` setting is
+# enabled.
+docstring-code-line-length = "dynamic"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.12.10",
+    "pytest>=8.4.1",
+]

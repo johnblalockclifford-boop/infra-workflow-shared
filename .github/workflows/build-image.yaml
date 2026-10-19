@@ -1,0 +1,35 @@
+name: Push Docker Image to Docker Hub
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "runner/Dockerfile"
+
+jobs:
+  push_to_docker_hub:
+    name: Push Docker Image to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        id: checkout_code
+        uses: actions/checkout@v4
+
+      - name: "Docker Login"
+        uses: azure/docker-login@v2
+        with:
+          login-server: ftdc4peacr1d.azurecr.io
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build Docker image
+        id: build_image
+        run: |
+          cd runner
+          docker build . -t ftdc4peacr1d.azurecr.io/platform-runner:$GITHUB_SHA -t ftdc4peacr1d.azurecr.io/platform-runner:latest
+          docker push ftdc4peacr1d.azurecr.io/platform-runner:$GITHUB_SHA
+          docker push ftdc4peacr1d.azurecr.io/platform-runner:latest
+
+      - name: Logout from Docker Hub
+        run: docker logout

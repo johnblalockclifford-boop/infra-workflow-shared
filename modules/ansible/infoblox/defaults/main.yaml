@@ -1,0 +1,4 @@
+---
+# Defaults for Infoblox
+infoblox_server: "faithddi.faith1.net"
+infoblox_domain_name: "faith1.net"

@@ -1,0 +1,199 @@
+name: plan and apply workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: environment to plan and apply terraform on
+      tf-version:
+        required: false
+        default: 1.9.1
+        type: string
+      azure-subscription-id:
+        required: true
+        type: string
+        description: Azure Subscription ID
+      azure-client-id:
+        required: true
+        type: string
+        description: Azure Client ID
+      azure-tenant-id:
+        required: true
+        type: string
+        description: Azure Tenant ID
+
+env:
+  TF_LOG: INFO
+  TF_ENV: ${{ inputs.environment }}
+  ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
+  ARM_TENANT_ID: ${{ inputs.azure-tenant-id}}
+  ARM_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id}}
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    outputs:
+      tfplanOutput: ${{ steps.tf-plan.outputs.exitcode }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf-version }}
+          terraform_wrapper: false
+
+      - name: Initialize Terraform
+        id: init
+        run: terraform init -backend-config="key=$TF_ENV.tfstate"
+
+      - name: Terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+        # An exit code of 0 indicated no changes, 1 a terraform failure, 2 there are pending changes.
+      - name: Terraform plan
+        id: tf-plan
+        run: |
+          export exitcode=0
+          terraform plan -var-file=$TF_ENV.tfvars -detailed-exitcode -no-color -out tfplan || export exitcode=$?
+
+          if [ $exitcode -eq 1 ]; then
+            # If the exit code was 1 (an actual error), exit the script with a status of '1', indicating failure.
+            echo "Terraform plan failed with errors"
+            exit 1
+          elif [ $exitcode -eq 2 ]; then
+            # If the exit code was 2 (changes to apply), continue but return a '0' status from this script.
+            echo "Terraform plan has changes to apply"
+            echo "exitcode=2" >> $GITHUB_OUTPUT # Set the output variable to reflect the changes
+          else
+            # If the exit code was 0 (no changes), just set the output variable.
+            echo "Terraform plan shows no changes"
+            echo "exitcode=0" >> $GITHUB_OUTPUT
+          fi
+          exit 0 # Ensure the script exits successfully
+
+      - name: Publish Plan
+        uses: actions/upload-artifact@v5
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: tfplan
+
+      # Create string output of Terraform Plan
+      - name: Create String Output
+        id: tf-plan-string
+        run: |
+          TERRAFORM_PLAN=$(terraform show -no-color tfplan)
+
+          delimiter="$(openssl rand -hex 8)"
+          echo "summary<<${delimiter}" >> $GITHUB_OUTPUT
+          echo "## Terraform Plan Output" >> $GITHUB_OUTPUT
+          echo "<details><summary>Click to expand</summary>" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo '```terraform' >> $GITHUB_OUTPUT
+          echo "$TERRAFORM_PLAN" >> $GITHUB_OUTPUT
+          echo '```' >> $GITHUB_OUTPUT
+          echo "</details>" >> $GITHUB_OUTPUT
+          echo "${delimiter}" >> $GITHUB_OUTPUT
+
+        # Publish Terraform Plan as task summary
+      - name: Publish Terraform Plan to Task Summary
+        env:
+          SUMMARY: ${{ steps.tf-plan-string.outputs.summary }}
+        run: echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+      # If this is a PR post the changes
+      # TODO: Implement Chris's update and replace instead of niave approach
+      - name: Push Terraform Output to PR
+        if: github.ref != 'refs/heads/main' && github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        env:
+          SUMMARY: "${{ steps.tf-plan-string.outputs.summary }}"
+        with:
+          github-token: ${{ inputs.GITHUB-TOKEN }} # I'm not sure this line is actually doing what we expect
+          script: |
+            const body = `${process.env.SUMMARY}`;
+            github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+            })
+
+  terraform-apply:
+    name: Terraform Apply
+    # Run if merging into main, OR pull request
+    if: (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') && needs.terraform-plan.outputs.tfplanOutput == 2
+    needs: [terraform-plan]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Terraform with specified version on the runner
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf-version }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        id: init
+        run: terraform init -backend-config="key=$TF_ENV.tfstate"
+
+      - name: Download Plan File
+        uses: actions/download-artifact@v6
+        with:
+          name: tfplan-${{ inputs.environment }}
+
+      - name: Terraform Apply
+        id: tf-apply
+        run: |
+          terraform apply -auto-approve -input=false tfplan | tee apply.log
+
+          if grep "Apply complete!" apply.log; then
+            echo "summary=$(grep --color=never -r "Apply complete!" apply.log)" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "summary=Apply Failed see pipeline logs" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+        # Publish Terraform Apply as task summary
+      - name: Publish Terraform Apply to Task Summary
+        env:
+          SUMMARY: ${{ steps.tf-apply.outputs.summary }}
+        run: |
+          echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+      # If this is a PR post the changes
+      - name: Push Terraform Output to PR
+        if: github.ref != 'refs/heads/main' && github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ inputs.GITHUB-TOKEN }} # I'm not sure this line is actually doing what we expect
+          script: |
+            const body = `Terraform Applied`;
+            github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+            })

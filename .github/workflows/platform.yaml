@@ -1,0 +1,574 @@
+name: Terraform Plan for All Environments
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: environment to plan and apply terraform on (prod, nonprod, dev, qa, uat, test)
+      tf-version:
+        required: false
+        type: string
+      azure-subscription-id:
+        required: false
+        type: string
+        description: Azure Subscription ID
+      azure-client-id:
+        required: false
+        type: string
+        description: Azure Client ID
+      azure-tenant-id:
+        required: false
+        type: string
+        description: Azure Tenant ID
+      tf-backend-storage-account-name:
+        required: false
+        type: string
+        description: Terraform Backend Azure Storage Account Name
+      always-run-terraform-apply:
+        required: false
+        type: boolean
+        default: false
+        description: Run terraform apply even when plan shows no changes (useful for generating terraform outputs for ansible)
+      ansible-vault-secrets:
+        required: false
+        type: string
+        default: ""
+        description: |
+          Credentials to hand the Ansible job, one `var_name=akv://<vault>/<secret>`
+          per line. The apply job resolves each from Key Vault, writes them to an
+          Ansible Vault encrypted group_vars file and publishes it as an artifact;
+          the ansible job decrypts it with the ANSIBLE_VAULT_PASSWORD secret.
+
+          Use this rather than a terraform output. `terraform output -json` writes
+          sensitive values in plaintext - `sensitive = true` suppresses CLI display
+          only - and this workflow uploads that file as an artifact any repo reader
+          can download.
+
+          Example:
+            ansible_user=akv://ftdc4-systemskeyvault1-d/faithlocadm-user
+            ansible_password=akv://ftdc4-systemskeyvault1-d/faithlocadm
+      ansible-vault-group:
+        required: false
+        type: string
+        default: "all"
+        description: |
+          Inventory group the decrypted credentials apply to; the file lands at
+          ansible/group_vars/<group>/vault.yml. Defaults to `all` because
+          connection variables such as ansible_user and ansible_password must
+          resolve at connection time, and group_vars are the only place a dynamic
+          inventory's hosts can pick them up - `--extra-vars` is evaluated too late.
+
+env:
+  TF_LOG: INFO
+  TF_ENV: ${{ inputs.environment}}
+  ARM_CLIENT_ID: ${{ inputs.azure-client-id || vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ inputs.azure-tenant-id || vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id || vars.ARM_SUBSCRIPTION_ID }}
+  TF_BACKEND_STORAGE_ACCOUNT_NAME: ${{ inputs.tf-backend-storage-account-name || vars.TF_BACKEND_STORAGE_ACCOUNT_NAME }}
+  TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  VSPHERE_USER: ${{ secrets.VSPHERE_USER }}
+  VSPHERE_PASSWORD: ${{ secrets.VSPHERE_PASSWORD }}
+  VSPHERE_SERVER: ${{ secrets.VSPHERE_SERVER }}
+  ANSIBLE_USER: ${{secrets.ANSIBLE_USER }}
+  ANSIBLE_PASSWORD: ${{secrets.ANSIBLE_PASSWORD }}
+  INFOBLOX_USERNAME: ${{ secrets.INFOBLOX_USERNAME }}
+  INFOBLOX_PASSWORD: ${{ secrets.INFOBLOX_PASSWORD }}
+  VM_LOCAL_USERNAME: ${{ secrets.LOCAL_VM_USER }}
+  VM_LOCAL_PASSWORD: ${{ secrets.LOCAL_VM_PASS }}
+
+jobs:
+  plan:
+    name: Terraform Plan for All Environments
+    runs-on: [self-hosted, fti, platform]
+    environment: ${{ inputs.environment }}
+    outputs:
+      tfplanOutput: ${{ steps.tf-plan.outputs.exitcode }}
+      container: ${{ steps.envmap.outputs.container }}
+      key: ${{ steps.envmap.outputs.key }}
+      run-ansible: ${{ steps.ansible-detect.outputs.run }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          owner: Faith-Technologies
+          repositories: infra-workflow-shared
+          app-id: ${{ secrets.INF_PLATFORM_APP_ID }}
+          private-key: ${{ secrets.INF_PLATFORM_APP_KEY }}
+
+      - name: Derive environment naming and backend details
+        id: envmap
+        shell: bash
+        run: |
+          set -euo pipefail
+          IN="${TF_ENV,,}"
+
+          case "$IN" in
+            prod|p)       MEDIUM="prod";    LONG="Production";      SHORT="p";   GROUP="prod" ;;
+            dev|d)        MEDIUM="dev";     LONG="Development";     SHORT="d";   GROUP="nonprod"   ;;
+            stage|s)      MEDIUM="stage";   LONG="Stage";           SHORT="s";   GROUP="nonprod"   ;;
+            test|t)       MEDIUM="test";    LONG="Test";            SHORT="t";   GROUP="nonprod"   ;;
+            uat)          MEDIUM="uat";     LONG="UAT";             SHORT="uat"; GROUP="nonprod"   ;;
+            nonprod|np)   MEDIUM="nonprod"; LONG="Non-Production";  SHORT="np";  GROUP="nonprod"   ;;
+            qa|q)         MEDIUM="qa";      LONG="QA";              SHORT="q";   GROUP="nonprod"   ;;
+            *)
+              echo "Unsupported inputs.environment: '$TF_ENV'"; exit 1
+              ;;
+          esac
+
+          REPO_LC="$(basename "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          CONTAINER_NAME="${REPO_LC}-${SHORT}"
+          KEY="${MEDIUM}.tfstate"
+
+          {
+            echo "MEDIUM=$MEDIUM"
+            echo "long=$LONG"
+            echo "medium=$MEDIUM"
+            echo "short=$SHORT"
+            echo "group=$GROUP"
+            echo "container=$CONTAINER_NAME"
+            echo "key=$KEY"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Repos created from the template carry placeholder ansible files - a
+      # main.yaml holding only a comment and a document marker. Running
+      # ansible-playbook against that fails, so the ansible job is gated on the
+      # playbook containing something other than comments, blank lines and
+      # YAML document markers. Editing the placeholder turns the job on.
+      - name: Detect Ansible configuration
+        id: ansible-detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          skip() {
+            echo "Skipping the ansible job: $1"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Ansible skipped: $1" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          [ -d ./ansible ] || skip "no ansible directory"
+          [ -n "$(find ./ansible -type f -print -quit)" ] || skip "the ansible directory is empty"
+          [ -f ./ansible/main.yaml ] || skip "no ansible/main.yaml playbook"
+
+          if ! grep -Evq '^[[:space:]]*(#.*)?$|^[[:space:]]*(---|\.\.\.)[[:space:]]*(#.*)?$' ./ansible/main.yaml; then
+            skip "ansible/main.yaml has no plays (placeholder only)"
+          fi
+
+          echo "ansible/main.yaml has plays; the ansible job will run."
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Terraform
+        if: ${{ inputs.tf-version == '' }}
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: <2.0.0
+          terraform_wrapper: false
+
+      - name: Setup Terraform
+        if: ${{ inputs.tf-version != '' }}
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.tf-version }}
+          terraform_wrapper: false
+
+      - name: Platform Action
+        uses: Faith-Technologies/infra-platform-action@main
+        with:
+          tool: terraform
+          action: plan
+          platform_config: ./platform.yaml
+          modules_dir: ./terraform/modules
+          github_token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Initialize Terraform
+        working-directory: ./terraform
+        run: |
+          terraform init -input=false \
+          -backend-config="storage_account_name=${{ env.TF_BACKEND_STORAGE_ACCOUNT_NAME }}" \
+          -backend-config="container_name=${{ steps.envmap.outputs.container }}" \
+          -backend-config="key=${{ steps.envmap.outputs.key }}"
+
+      - name: Terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      # Generates an execution plan for Terraform
+      # An exit code of 0 indicated no changes, 1 a terraform failure, 2 there are pending changes.
+      - name: Terraform Plan
+        id: tf-plan
+        working-directory: ./terraform
+        run: |
+          export exitcode=0
+          terraform plan -var-file=$TF_ENV.tfvars -detailed-exitcode -no-color -out tfplan || exitcode=$? # Capture the exit code
+
+          if [ $exitcode -eq 1 ]; then
+            # If the exit code was 1 (an actual error), exit the script with a status of '1', indicating failure.
+            echo "Terraform plan failed with errors"
+            exit 1
+          elif [ $exitcode -eq 2 ]; then
+            # If the exit code was 2 (changes to apply), continue but return a '0' status from this script.
+            echo "Terraform plan has changes to apply"
+            echo "exitcode=2" >> $GITHUB_OUTPUT # Set the output variable to reflect the changes
+          else
+            # If the exit code was 0 (no changes), just set the output variable.
+            echo "Terraform plan shows no changes"
+            echo "exitcode=0" >> $GITHUB_OUTPUT
+          fi
+          exit 0 # Ensure the script exits successfully
+
+      - name: Publish Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ./terraform/tfplan
+
+      - name: Terraform show for json plan
+        working-directory: ./terraform
+        run: |
+          terraform show -json tfplan > tfplan.json
+
+      # Published separately from the binary plan so it can be read without
+      # terraform. This is what lets a policy engine decide a gate from what the
+      # change actually does - destroys, protected resource types - rather than
+      # from the environment name alone.
+      #
+      # Its own artifact rather than an addition to tfplan-<env>: that one is
+      # downloaded by the apply job into ./terraform
+      - name: Publish Plan JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-json-${{ inputs.environment }}
+          path: ./terraform/tfplan.json
+
+      # Render the plan to markdown files rather than a step output. A large plan passed
+      # through an env var exceeds the kernel's 128 KiB per-argument limit and the next
+      # step fails with "Argument list too long". Two sizes are written because the step
+      # summary allows 1 MiB but a PR comment only 65536 characters.
+      - name: Create String Output
+        id: tf-plan-string
+        working-directory: ./terraform
+        run: |
+          terraform show -no-color tfplan > plan.txt
+
+          render() {
+            local max=$1
+            echo "## Terraform Plan Output: ${TF_ENV}"
+            echo "<details><summary>Click to expand</summary>"
+            echo ""
+            echo '```terraform'
+            if [ "$(wc -c < plan.txt)" -gt "$max" ]; then
+              head -c "$max" plan.txt
+              echo ""
+              echo "... plan truncated, see the workflow run summary or logs for the full output ..."
+              grep -E '^(Plan:|No changes\.)' plan.txt || true
+            else
+              cat plan.txt
+            fi
+            echo '```'
+            echo "</details>"
+          }
+
+          render 900000 > plan_summary.md
+          render 60000 > plan_comment.md
+
+        # Publish Terraform Plan as task summary
+      - name: Publish Terraform Plan to Task Summary
+        working-directory: ./terraform
+        run: cat plan_summary.md >> $GITHUB_STEP_SUMMARY
+
+      # Callers trigger on push, not pull_request, so context.issue is empty here. Look
+      # up the open PR for the pushed branch instead. One comment per environment,
+      # found by a hidden marker, is deleted and re-posted so the latest plan is at the
+      # bottom of the conversation and stale plans don't pile up. A failure here (missing
+      # pull-requests: write, API hiccup) must not block the apply, hence continue-on-error.
+      - name: Push Terraform Output to PR
+        if: github.ref != 'refs/heads/main' && github.event_name != 'schedule'
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          COMMENT_FILE: ./terraform/plan_comment.md
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const marker = `<!-- terraform-plan:${process.env.TF_ENV} -->`;
+
+            let prs = [];
+            if (context.eventName === 'pull_request') {
+              prs = [context.issue.number];
+            } else {
+              const branch = context.ref.replace(/^refs\/heads\//, '');
+              const { data } = await github.rest.pulls.list({ owner, repo, state: 'open', head: `${owner}:${branch}` });
+              prs = data.map(pr => pr.number);
+            }
+            if (prs.length === 0) {
+              core.info(`No open pull request for ${context.ref}; the plan is in the run summary only.`);
+              return;
+            }
+
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = `${marker}\n${fs.readFileSync(process.env.COMMENT_FILE, 'utf8')}\n[Workflow run](${runUrl}) for ${context.sha.slice(0, 7)}`;
+
+            for (const issue_number of prs) {
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+              for (const c of comments.filter(c => c.user?.type === 'Bot' && c.body?.includes(marker))) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              core.info(`Posted the ${process.env.TF_ENV} plan to #${issue_number}.`);
+            }
+
+  apply:
+    name: Terraform Apply
+    # Run if merging into main, OR pull request
+    if: (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') && (needs.plan.outputs.tfplanOutput == 2 || inputs.always-run-terraform-apply == true)
+    needs: [plan]
+    runs-on: [self-hosted, fti, platform]
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          owner: Faith-Technologies
+          repositories: infra-workflow-shared
+          app-id: ${{ secrets.INF_PLATFORM_APP_ID }}
+          private-key: ${{ secrets.INF_PLATFORM_APP_KEY }}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        if: ${{ inputs.tf-version == '' }}
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: <2.0.0
+          terraform_wrapper: false
+
+      - name: Setup Terraform
+        if: ${{ inputs.tf-version != '' }}
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.tf-version }}
+          terraform_wrapper: false
+
+      - name: Platform Action
+        uses: Faith-Technologies/infra-platform-action@main
+        with:
+          tool: terraform
+          action: apply
+          platform_config: ./platform.yaml
+          modules_dir: ./terraform/modules
+          github_token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Initialize Terraform
+        working-directory: ./terraform
+        run: |
+          terraform init -input=false \
+          -backend-config="storage_account_name=${{ env.TF_BACKEND_STORAGE_ACCOUNT_NAME }}" \
+          -backend-config="container_name=${{ needs.plan.outputs.container }}" \
+          -backend-config="key=${{ needs.plan.outputs.key }}"
+
+      - name: Download Plan File
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ./terraform
+
+      - name: Terraform Apply
+        id: tf-apply
+        working-directory: ./terraform
+        run: |
+          terraform apply -auto-approve -input=false tfplan | tee apply.log
+
+          if grep "Apply complete!" apply.log; then
+            echo "summary=$(grep --color=never -r "Apply complete!" apply.log)" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "summary=Apply Failed see pipeline logs" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Publish Terraform Apply to Task Summary
+        env:
+          SUMMARY: ${{ steps.tf-apply.outputs.summary }}
+        run: |
+          echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+      - name: Save Outputs
+        working-directory: ./terraform
+        run: |
+          terraform output -json > terraform_output.json
+
+      - name: Upload Terraform Outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs-${{ inputs.environment }}
+          path: ./terraform/terraform_output.json
+
+      # Credentials for the Ansible job travel as an Ansible Vault encrypted
+      # artifact rather than a terraform output, which would be plaintext and
+      # downloadable. This job already holds Azure credentials, so no additional
+      # identity or Key Vault grant is introduced by reading the secrets here.
+      - name: Publish encrypted Ansible credentials
+        if: ${{ inputs.ansible-vault-secrets != '' && needs.plan.outputs.run-ansible == 'true' }}
+        env:
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+          VAULT_SECRETS: ${{ inputs.ansible-vault-secrets }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ANSIBLE_VAULT_PASSWORD:-}" ]; then
+            echo "ansible-vault-secrets was supplied but the ANSIBLE_VAULT_PASSWORD secret is not set."
+            echo "The ansible job would download an artifact it cannot decrypt, so failing here instead."
+            exit 1
+          fi
+
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+          umask 077
+
+          plain="$workdir/vault.yml"
+          : > "$plain"
+
+          while IFS= read -r line; do
+            line="$(echo "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$line" ] && continue
+
+            name="${line%%=*}"
+            ref="${line#*=}"
+            case "$ref" in
+              akv://*) ;;
+              *) echo "Malformed entry '$line' - expected var_name=akv://<vault>/<secret>"; exit 1 ;;
+            esac
+            ref="${ref#akv://}"
+            vault="${ref%%/*}"
+            secret="${ref#*/}"
+
+            if ! value="$(az keyvault secret show --vault-name "$vault" --name "$secret" --query value -o tsv)"; then
+              echo "Could not read secret '$secret' from key vault '$vault'."
+              echo "Confirm this environment's service principal has get on that secret."
+              exit 1
+            fi
+
+            # Mask before the value can reach any later log line.
+            echo "::add-mask::$value"
+            # Quote and escape so passwords containing YAML metacharacters survive.
+            printf '%s: "%s"\n' "$name" "$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')" >> "$plain"
+          done <<< "$VAULT_SECRETS"
+
+          printf '%s' "$ANSIBLE_VAULT_PASSWORD" > "$workdir/.vaultpw"
+          mkdir -p ./ansible-vault
+          ansible-vault encrypt "$plain" \
+            --output ./ansible-vault/vault.yml \
+            --vault-password-file "$workdir/.vaultpw"
+
+          # Cheap proof the artifact is actually ciphertext before it is published.
+          head -c 30 ./ansible-vault/vault.yml | grep -q '^\$ANSIBLE_VAULT' \
+            || { echo "Refusing to upload: output is not Ansible Vault encrypted."; exit 1; }
+
+      - name: Upload encrypted Ansible credentials
+        if: ${{ inputs.ansible-vault-secrets != '' && needs.plan.outputs.run-ansible == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ansible-vault-${{ inputs.environment }}
+          path: ./ansible-vault/vault.yml
+
+  ansible:
+    name: Ansible Tasks
+    needs: [plan, apply]
+    if: ${{ needs.plan.outputs.run-ansible == 'true' }}
+    runs-on: [self-hosted, fti, platform]
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          owner: Faith-Technologies
+          repositories: infra-workflow-shared
+          app-id: ${{ secrets.INF_PLATFORM_APP_ID }}
+          private-key: ${{ secrets.INF_PLATFORM_APP_KEY }}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-outputs-${{ inputs.environment }}
+          path: ./
+
+      # group_vars rather than --extra-vars: connection variables must resolve
+      # when the host is contacted, which is before extra-vars are applied.
+      - name: Download encrypted Ansible credentials
+        if: ${{ inputs.ansible-vault-secrets != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ansible-vault-${{ inputs.environment }}
+          path: ./ansible/group_vars/${{ inputs.ansible-vault-group }}
+
+      - name: Platform Action
+        uses: Faith-Technologies/infra-platform-action@main
+        with:
+          tool: ansible
+          action: apply
+          platform_config: ./platform.yaml
+          modules_dir: ./ansible/roles
+          root_dir: .
+          github_token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Run Ansible Tasks
+        working-directory: ./ansible
+        env:
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+          VAULT_SECRETS: ${{ inputs.ansible-vault-secrets }}
+        run: |
+          set -euo pipefail
+
+          if [ -f "inventory.yaml" ]; then
+            INVENTORY="inventory.yaml"
+          elif [ -f "inventory.py" ]; then
+            chmod +x inventory.py
+            INVENTORY="inventory.py"
+          else
+            echo "Error: No inventory file found (inventory.yaml or inventory.py)"
+            exit 1
+          fi
+
+          VAULT_ARGS=()
+          if [ -n "${VAULT_SECRETS:-}" ]; then
+            VAULT_PW_FILE="$(mktemp)"
+            trap 'rm -f "$VAULT_PW_FILE"' EXIT
+            umask 077
+            printf '%s' "$ANSIBLE_VAULT_PASSWORD" > "$VAULT_PW_FILE"
+            VAULT_ARGS=(--vault-password-file "$VAULT_PW_FILE")
+          fi
+
+          ansible-playbook \
+            -i "$INVENTORY" \
+            --extra-vars "@vars.yaml" \
+            "${VAULT_ARGS[@]}" \
+            ./main.yaml

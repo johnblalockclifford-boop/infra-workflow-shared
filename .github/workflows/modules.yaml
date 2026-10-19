@@ -1,0 +1,217 @@
+name: Module Versioning Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - "modules/**"
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [closed]
+
+jobs:
+  analyze-pr:
+    name: Analyze PR Changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python with UV
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: uv sync
+        working-directory: scripts
+
+      - name: Analyze PR changes
+        id: analyze
+        working-directory: scripts
+        run: |
+          # Run analysis and save to file
+          uv run python workflow_orchestrator.py --repo-root .. analyze-pr \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }} \
+            --output analysis.json
+
+          # Check if analysis found any changes
+          if [ -s analysis.json ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate and post PR comment
+        if: steps.analyze.outputs.has_changes == 'true'
+        working-directory: scripts
+        run: |
+          # Generate comment from analysis (file already exists from previous step)
+          uv run python workflow_orchestrator.py --repo-root .. generate-comment analysis.json --output comment.md
+
+          # Post comment using GitHub CLI
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  process-comments:
+    name: Process Version Commands
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && (contains(github.event.comment.body, '.bumpver') || contains(github.event.comment.body, '.setver'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python with UV
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: uv sync
+        working-directory: scripts
+
+      - name: Get all modules
+        id: get-modules
+        working-directory: scripts
+        run: |
+          # Get list of all valid modules
+          uv run python module_detector.py --repo-root .. --format json > modules.json
+
+          # Extract module names
+          cat modules.json | jq -r '.[].name' > module_names.txt
+
+      - name: Process comment commands
+        id: process
+        working-directory: scripts
+        run: |
+          # Save comment to file. The body comes in via env rather than an
+          # inline expression, so a comment can't inject shell into this step.
+          printf '%s\n' "$COMMENT_BODY" > comment.txt
+
+          # Process commands
+          uv run python workflow_orchestrator.py --repo-root .. process-comments \
+            comment.txt module_names.txt --output commands.json
+
+          # Check if any valid commands were found
+          COMMAND_COUNT=$(cat commands.json | jq -r '.valid_commands')
+          echo "command_count=$COMMAND_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$COMMAND_COUNT" -gt 0 ]; then
+            # Generate confirmation comment
+            SUMMARY=$(cat commands.json | jq -r '.summary')
+            echo "## ✅ Version Commands Processed" > confirmation.md
+            echo "" >> confirmation.md
+            echo "$SUMMARY" >> confirmation.md
+            echo "" >> confirmation.md
+            echo "These version changes will be applied when the PR is merged." >> confirmation.md
+            
+            # Post confirmation
+            gh issue comment ${{ github.event.issue.number }} --body-file confirmation.md
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+
+  create-tags:
+    name: Create Tags and Update Metadata
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python with UV
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: uv sync
+        working-directory: scripts
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Analyze merged PR
+        id: analyze
+        working-directory: scripts
+        run: |
+          # Analyze the merged PR changes
+          uv run python workflow_orchestrator.py --repo-root .. analyze-pr \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }} \
+            --output analysis.json
+
+      - name: Get PR comments for version commands
+        id: get-commands
+        working-directory: scripts
+        run: |
+          # Only process user-authored command comments.
+          # Ignore workflow-generated comments because they include example
+          # .bumpver/.setver commands that are instructions, not overrides.
+          gh pr view ${{ github.event.pull_request.number }} --json comments --jq '.comments[] | select((.body | contains("## 📦 Module Versioning Analysis") | not) and (.author.login != "github-actions[bot]") and (.body | test("\\.(bumpver|setver)"; "i"))) | .body' > comments.txt
+
+          # Get module names
+          uv run python module_detector.py --repo-root .. --format json | jq -r '.[].name' > module_names.txt
+
+          # Process any version commands from comments
+          uv run python workflow_orchestrator.py --repo-root .. process-comments \
+            comments.txt module_names.txt --output commands.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculate final versions
+        id: versions
+        working-directory: scripts
+        run: |
+          # Combine analysis and commands to get final versions
+          uv run python workflow_orchestrator.py --repo-root .. calculate-versions \
+            analysis.json commands.json --output final_versions.json
+
+      - name: Create tags
+        working-directory: scripts
+        run: |
+          # Create tags for all modules with version changes
+          if [ -s final_versions.json ] && [ "$(cat final_versions.json)" != "{}" ]; then
+            uv run python workflow_orchestrator.py --repo-root .. create-tags \
+              final_versions.json analysis.json --push
+            echo "Tags created and pushed successfully"
+          else
+            echo "No version changes to tag"
+          fi
+
+      - name: Update module metadata
+        working-directory: scripts
+        run: |
+          # Update README.md files with new version information
+          if [ -s final_versions.json ] && [ "$(cat final_versions.json)" != "{}" ]; then
+            uv run python workflow_orchestrator.py --repo-root .. update-metadata \
+              final_versions.json analysis.json
+            
+            # Commit and push metadata updates
+            cd ..
+            if ! git diff --quiet; then
+              git add -A
+              git commit -m "Update module metadata after version release [skip ci]"
+              git push origin main
+              echo "Module metadata updated successfully"
+            else
+              echo "No metadata changes to commit"
+            fi
+          else
+            echo "No metadata updates needed"
+          fi

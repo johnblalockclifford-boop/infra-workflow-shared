@@ -1,0 +1,4 @@
+---
+- name: Reboot Windows
+  ansible.windows.win_reboot:
+  when: join_result.reboot_required

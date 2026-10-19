@@ -1,0 +1,12 @@
+---
+- name: "Create an A record in Infoblox"
+  infoblox.nios_modules.nios_a_record:
+    name: "{{ vm_name }}.{{ infoblox_domain_name }}"
+    ipv4: "{{ vm_ip }}"
+    state: present
+    provider:
+      host: "{{ infoblox_server }}"
+      username: "{{ lookup('env', 'INFOBLOX_USERNAME') }}"
+      password: "{{ lookup('env', 'INFOBLOX_PASSWORD') }}"
+      wapi_version: "2.12.3"
+      validate_certs: false

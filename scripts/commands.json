@@ -1,0 +1,12 @@
+{
+  "commands": {
+    "t-servicebus": [
+      "bump",
+      "major"
+    ]
+  },
+  "valid_commands": 1,
+  "total_commands": 1,
+  "errors": [],
+  "summary": "## Parsed Version Commands\n\n- **t-servicebus**: Bump major version\n"
+}
